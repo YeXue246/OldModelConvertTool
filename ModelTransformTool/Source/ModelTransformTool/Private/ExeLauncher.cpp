@@ -482,6 +482,46 @@ void UExeLauncher::LaunchExeAsync(const FString& ExePath, const FString& Args, c
                 }
             }
 
+            if (bSuccess && Task.bIsFolderTask && !OutputFilePath.IsEmpty())
+            {
+                FString ConvertedPath = FPaths::ConvertRelativePathToFull(OutputFilePath);
+                FString InputPath = FPaths::ConvertRelativePathToFull(Task.InputFile);
+                FPaths::NormalizeFilename(ConvertedPath);
+                FPaths::NormalizeFilename(InputPath);
+
+                if (!ConvertedPath.Equals(InputPath, ESearchCase::IgnoreCase))
+                {
+                    bool bReplaced = false;
+                    IFileManager& FileManager = IFileManager::Get();
+
+                    if (FileManager.FileExists(*ConvertedPath))
+                    {
+                        if (FileManager.Delete(*InputPath, false, true, true))
+                        {
+                            bReplaced = (FileManager.Move(*InputPath, *ConvertedPath, true, true) == COPY_OK);
+                        }
+                        else
+                        {
+                            UE_LOG(LogTemp, Error, TEXT("Failed to delete original input file before replace: %s"), *InputPath);
+                        }
+                    }
+
+                    if (!bReplaced)
+                    {
+                        bSuccess = false;
+                        OutputFilePath = TEXT("");
+                        OutputFileName = TEXT("");
+                        UE_LOG(LogTemp, Error, TEXT("Failed to replace original file for folder task: %s"), *Task.InputFile);
+                    }
+                    else
+                    {
+                        OutputFilePath = InputPath;
+                        OutputFileName = FPaths::GetCleanFilename(InputPath);
+                        UE_LOG(LogTemp, Log, TEXT("Replaced original folder-task input file: %s"), *InputPath);
+                    }
+                }
+            }
+
 
             if (TaskCompletedCallback.IsBound())
             {
