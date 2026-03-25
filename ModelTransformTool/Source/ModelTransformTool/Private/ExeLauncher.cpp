@@ -15,6 +15,7 @@ TQueue<FExeTask> UExeLauncher::TaskQueue;
 bool UExeLauncher::bIsRunning = false;
 bool UExeLauncher::bAllTasksSuccess = true;
 FString UExeLauncher::LasstTasksOutputFloder = "";
+TSet<FString> UExeLauncher::FailedFolderTaskKeys;
 
 FOnTaskCompleted UExeLauncher::TaskCompletedCallback;
 FOnAllTasksCompleted UExeLauncher::AllTasksCompletedCallback;
@@ -46,6 +47,7 @@ bool GetDiskFreeSpaceBytes(const FString& AnyPathOnDisk, int64& OutFreeBytes)
 void UExeLauncher::HandleTaskFailure(const FExeTask& Task, const FString& ErrorMessage, bool bShowDialog, int64 RequiredBytes, int64 FreeBytes)
 {
     bAllTasksSuccess = false;
+    MarkFolderTaskFailed(Task);
 
     UE_LOG(LogTemp, Error, TEXT("%s : %s"), *ErrorMessage, *Task.InputFile);
 
@@ -94,7 +96,36 @@ void UExeLauncher::AddTask(const FString& InputFile, const FString& OutputFolder
         }
     }
 
-    TaskQueue.Enqueue(FExeTask{ InFile, OutDir, TeFile });
+    if (IFileManager::Get().DirectoryExists(*InFile))
+    {
+        TArray<FString> FilesInFolder;
+        IFileManager::Get().FindFilesRecursive(FilesInFolder, *InFile, TEXT("*.*"), true, false, false);
+        FilesInFolder.Sort();
+
+        if (FilesInFolder.IsEmpty())
+        {
+            UE_LOG(LogTemp, Warning, TEXT("Folder task has no files: %s"), *InFile);
+            return;
+        }
+
+        for (const FString& FilePath : FilesInFolder)
+        {
+            FString NormalizedFile = FPaths::ConvertRelativePathToFull(FilePath);
+            FPaths::NormalizeFilename(NormalizedFile);
+
+            FExeTask FolderTask;
+            FolderTask.InputFile = NormalizedFile;
+            FolderTask.OutputFolder = OutDir;
+            FolderTask.TemplateFile = TeFile;
+            FolderTask.bIsFolderTask = true;
+            FolderTask.FolderTaskKey = InFile;
+
+            TaskQueue.Enqueue(FolderTask);
+        }
+        return;
+    }
+
+    TaskQueue.Enqueue(FExeTask{ InFile, OutDir, TeFile, false, TEXT("") });
 }
 
 void UExeLauncher::RunQueue(const FOnTaskCompleted& OnTaskCompleted, const FOnAllTasksCompleted& OnAllTasksCompleted, const FOnTaskStarted& OnTaskStarted)
@@ -108,6 +139,7 @@ void UExeLauncher::RunQueue(const FOnTaskCompleted& OnTaskCompleted, const FOnAl
     bIsRunning = true;
     bAllTasksSuccess = true;
     LasstTasksOutputFloder = TEXT("");
+    FailedFolderTaskKeys.Reset();
     TaskCompletedCallback = OnTaskCompleted;
     AllTasksCompletedCallback = OnAllTasksCompleted;
     TaskStartedCallback = OnTaskStarted;
@@ -132,7 +164,21 @@ void UExeLauncher::ExecuteNextTask()
 {
     FExeTask CurrentTask;
 
-    if (!TaskQueue.Dequeue(CurrentTask)) 
+    while (TaskQueue.Dequeue(CurrentTask))
+    {
+        if (!ShouldSkipTask(CurrentTask))
+        {
+            break;
+        }
+
+        UE_LOG(LogTemp, Warning, TEXT("Skip folder task file due to previous failure: %s"), *CurrentTask.InputFile);
+        if (TaskCompletedCallback.IsBound())
+        {
+            TaskCompletedCallback.Execute(CurrentTask.InputFile, TEXT(""), TEXT(""));
+        }
+    }
+
+    if (ShouldSkipTask(CurrentTask) || CurrentTask.InputFile.IsEmpty())
     {
         bIsRunning = false;
         if (AllTasksCompletedCallback.IsBound())
@@ -303,7 +349,7 @@ void UExeLauncher::LaunchExeAsync(const FString& ExePath, const FString& Args, c
                 UE_LOG(LogTemp, Warning, TEXT("Failed to start exe: %s"), *FullExePath);
 
                 bAllTasksSuccess = false;
-                bIsRunning = false;
+                MarkFolderTaskFailed(Task);
 
                 if (TaskCompletedCallback.IsBound())
                 {
@@ -314,6 +360,10 @@ void UExeLauncher::LaunchExeAsync(const FString& ExePath, const FString& Args, c
                 }
 
                 FPlatformProcess::ClosePipe(ReadPipe, WritePipe);
+                AsyncTask(ENamedThreads::GameThread, []()
+                    {
+                        ExecuteNextTask();
+                    });
                 return;
             }
 
@@ -438,6 +488,15 @@ void UExeLauncher::LaunchExeAsync(const FString& ExePath, const FString& Args, c
                     });
             }
 
+            if (!bSuccess || OutputFilePath.IsEmpty())
+            {
+                AsyncTask(ENamedThreads::GameThread, [Task]()
+                    {
+                        bAllTasksSuccess = false;
+                        MarkFolderTaskFailed(Task);
+                    });
+            }
+
             FPlatformProcess::ClosePipe(ReadPipe, WritePipe);
             FPlatformProcess::CloseProc(CurrentProcHandle);
             CurrentProcHandle.Reset();
@@ -447,6 +506,19 @@ void UExeLauncher::LaunchExeAsync(const FString& ExePath, const FString& Args, c
                     ExecuteNextTask();
                 });
         });
+}
+
+void UExeLauncher::MarkFolderTaskFailed(const FExeTask& Task)
+{
+    if (Task.bIsFolderTask && !Task.FolderTaskKey.IsEmpty())
+    {
+        FailedFolderTaskKeys.Add(Task.FolderTaskKey);
+    }
+}
+
+bool UExeLauncher::ShouldSkipTask(const FExeTask& Task)
+{
+    return Task.bIsFolderTask && FailedFolderTaskKeys.Contains(Task.FolderTaskKey);
 }
 
 
@@ -464,8 +536,10 @@ void UExeLauncher::CancelTaskByInput(const FString& InputFile)
     {
         FString NormalizedTask = FPaths::ConvertRelativePathToFull(Task.InputFile);
         FPaths::MakePlatformFilename(NormalizedTask);
+        FString NormalizedTaskFolderKey = FPaths::ConvertRelativePathToFull(Task.FolderTaskKey);
+        FPaths::MakePlatformFilename(NormalizedTaskFolderKey);
 
-        if (NormalizedTask != NormalizedInput)
+        if (NormalizedTask != NormalizedInput && NormalizedTaskFolderKey != NormalizedInput)
         {
             NewQueue.Enqueue(Task);
         }
@@ -484,6 +558,7 @@ void UExeLauncher::ClearAllTasks()
     FScopeLock Lock(&Mutex);
     FExeTask Dummy;
     while (TaskQueue.Dequeue(Dummy)) {}
+    FailedFolderTaskKeys.Reset();
     UE_LOG(LogTemp, Log, TEXT("Cleared all pending tasks"));
 }
 
@@ -501,6 +576,7 @@ void UExeLauncher::AbortAllTasks()
 
         FExeTask Dummy;
         while (TaskQueue.Dequeue(Dummy)) {}
+        FailedFolderTaskKeys.Reset();
     }
 
     bIsRunning = false;
@@ -572,4 +648,3 @@ bool UExeLauncher::FileIsLargerThanKB(const FString& FilePath, const int32 Targe
 {
     return ((IFileManager::Get().FileSize(*FilePath)) > (TargetSize * 1024));
 }
-
