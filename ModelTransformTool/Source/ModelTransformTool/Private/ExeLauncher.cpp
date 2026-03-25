@@ -139,7 +139,10 @@ void UExeLauncher::RunQueue(const FOnTaskCompleted& OnTaskCompleted, const FOnAl
     bIsRunning = true;
     bAllTasksSuccess = true;
     LasstTasksOutputFloder = TEXT("");
-    FailedFolderTaskKeys.Reset();
+    {
+        FScopeLock Lock(&Mutex);
+        FailedFolderTaskKeys.Reset();
+    }
     TaskCompletedCallback = OnTaskCompleted;
     AllTasksCompletedCallback = OnAllTasksCompleted;
     TaskStartedCallback = OnTaskStarted;
@@ -512,13 +515,20 @@ void UExeLauncher::MarkFolderTaskFailed(const FExeTask& Task)
 {
     if (Task.bIsFolderTask && !Task.FolderTaskKey.IsEmpty())
     {
+        FScopeLock Lock(&Mutex);
         FailedFolderTaskKeys.Add(Task.FolderTaskKey);
     }
 }
 
 bool UExeLauncher::ShouldSkipTask(const FExeTask& Task)
 {
-    return Task.bIsFolderTask && FailedFolderTaskKeys.Contains(Task.FolderTaskKey);
+    if (!Task.bIsFolderTask)
+    {
+        return false;
+    }
+
+    FScopeLock Lock(&Mutex);
+    return FailedFolderTaskKeys.Contains(Task.FolderTaskKey);
 }
 
 
