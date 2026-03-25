@@ -19,13 +19,15 @@ struct FExeTask
     FString InputFile;
     FString OutputFolder;
     FString TemplateFile;
+    bool bIsFolderTask = false;
+    FString FolderTaskKey;
 };
 
 UENUM(BlueprintType)
 enum class EExeType : uint8
 {
-    Background, // 无UI后台运行
-    GuiHidden   // GUI EXE 隐藏窗口运行
+    Background, // Background process
+    GuiHidden   // GUI EXE hidden launch
 };
 
 
@@ -71,6 +73,8 @@ private:
     static void ExecuteNextTask();
     static void CopyDependencies(const FString& ExeDir);
     static void LaunchExeAsync(const FString& ExePath, const FString& Args, const FString& OutputFolder, const FExeTask& Task);
+    static void MarkFolderTaskFailed(const FExeTask& Task);
+    static bool ShouldSkipTask(const FExeTask& Task);
 
     static void HandleTaskFailure(const FExeTask& Task, const FString& ErrorMessage, bool bShowDialog = false, int64 RequiredBytes = 0, int64 FreeBytes = 0);
 
@@ -83,6 +87,7 @@ private:
     static FOnTaskCompleted TaskCompletedCallback;
     static FOnAllTasksCompleted AllTasksCompletedCallback;
     static FOnTaskStarted TaskStartedCallback;
+    static TSet<FString> FailedFolderTaskKeys;
 
     static FProcHandle CurrentProcHandle;
     static FCriticalSection Mutex;
