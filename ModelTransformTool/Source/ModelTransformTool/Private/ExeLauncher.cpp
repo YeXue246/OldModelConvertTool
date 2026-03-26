@@ -16,6 +16,9 @@ bool UExeLauncher::bIsRunning = false;
 bool UExeLauncher::bAllTasksSuccess = true;
 FString UExeLauncher::LasstTasksOutputFloder = "";
 TSet<FString> UExeLauncher::FailedFolderTaskKeys;
+TMap<FString, int32> UExeLauncher::FolderTaskRemainingCounts;
+TMap<FString, FString> UExeLauncher::FolderTaskOriginalInputPaths;
+TMap<FString, FString> UExeLauncher::FolderTaskOutputFolders;
 
 FOnTaskCompleted UExeLauncher::TaskCompletedCallback;
 FOnAllTasksCompleted UExeLauncher::AllTasksCompletedCallback;
@@ -63,7 +66,11 @@ void UExeLauncher::HandleTaskFailure(const FExeTask& Task, const FString& ErrorM
         FMessageDialog::Open(EAppMsgType::Ok, MsgText);
     }
 
-    if (TaskCompletedCallback.IsBound())
+    if (Task.bIsFolderTask)
+    {
+        HandleFolderTaskProgress(Task);
+    }
+    else if (TaskCompletedCallback.IsBound())
     {
         TaskCompletedCallback.Execute(Task.InputFile, TEXT(""), TEXT(""));
     }
@@ -72,9 +79,16 @@ void UExeLauncher::HandleTaskFailure(const FExeTask& Task, const FString& ErrorM
 }
 
 
-void UExeLauncher::AddTask(const FString& InputFile, const FString& OutputFolder, const FString& TemplateFile)
+void UExeLauncher::AddTask(const FString& InputFile, const FString& OutputFolder, const FString& TemplateFile, const FString& FolderModelExtensionsCsv, const FString& OriginalInputPath)
 {
     FScopeLock Lock(&Mutex);
+
+    const FString TrimmedInput = InputFile.TrimStartAndEnd();
+    if (TrimmedInput.IsEmpty())
+    {
+        UE_LOG(LogTemp, Error, TEXT("AddTask failed: InputFile is empty"));
+        return;
+    }
 
     FString InFile = FPaths::ConvertRelativePathToFull(InputFile);
     FString OutDir = FPaths::ConvertRelativePathToFull(OutputFolder);
@@ -83,6 +97,12 @@ void UExeLauncher::AddTask(const FString& InputFile, const FString& OutputFolder
     FPaths::NormalizeFilename(InFile);
     FPaths::NormalizeFilename(OutDir);
     FPaths::NormalizeFilename(TeFile);
+
+    if (!IFileManager::Get().DirectoryExists(*InFile) && !IFileManager::Get().FileExists(*InFile))
+    {
+        UE_LOG(LogTemp, Error, TEXT("AddTask failed: input path does not exist: %s"), *InFile);
+        return;
+    }
 
     if (!IFileManager::Get().DirectoryExists(*OutDir))
     {
@@ -99,8 +119,25 @@ void UExeLauncher::AddTask(const FString& InputFile, const FString& OutputFolder
     if (IFileManager::Get().DirectoryExists(*InFile))
     {
         TArray<FString> FilesInFolder;
-        IFileManager::Get().FindFilesRecursive(FilesInFolder, *InFile, TEXT("*.*"), true, false, false);
+        IFileManager::Get().FindFilesRecursive(FilesInFolder, *InFile, TEXT("*"), true, false, false);
         FilesInFolder.Sort();
+
+        TSet<FString> AllowedModelExtensions;
+        TArray<FString> ExtTokens;
+        FolderModelExtensionsCsv.ParseIntoArray(ExtTokens, TEXT(","), true);
+        for (FString Ext : ExtTokens)
+        {
+            Ext.TrimStartAndEndInline();
+            Ext = Ext.ToLower();
+            if (Ext.StartsWith(TEXT(".")))
+            {
+                Ext.RightChopInline(1, false);
+            }
+            if (!Ext.IsEmpty())
+            {
+                AllowedModelExtensions.Add(Ext);
+            }
+        }
 
         if (FilesInFolder.IsEmpty())
         {
@@ -108,10 +145,18 @@ void UExeLauncher::AddTask(const FString& InputFile, const FString& OutputFolder
             return;
         }
 
+        int32 EnqueuedCount = 0;
         for (const FString& FilePath : FilesInFolder)
         {
             FString NormalizedFile = FPaths::ConvertRelativePathToFull(FilePath);
             FPaths::NormalizeFilename(NormalizedFile);
+            const FString FileExt = FPaths::GetExtension(NormalizedFile, false).ToLower();
+
+            if (!AllowedModelExtensions.IsEmpty() && !AllowedModelExtensions.Contains(FileExt))
+            {
+                UE_LOG(LogTemp, Verbose, TEXT("Skip non-model file in folder task: %s"), *NormalizedFile);
+                continue;
+            }
 
             FExeTask FolderTask;
             FolderTask.InputFile = NormalizedFile;
@@ -121,6 +166,22 @@ void UExeLauncher::AddTask(const FString& InputFile, const FString& OutputFolder
             FolderTask.FolderTaskKey = InFile;
 
             TaskQueue.Enqueue(FolderTask);
+            ++EnqueuedCount;
+        }
+
+        if (EnqueuedCount == 0)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("Folder task has no supported model files: %s"), *InFile);
+        }
+        else
+        {
+            FString NormalizedOriginalInput = OriginalInputPath.TrimStartAndEnd().IsEmpty()
+                ? InFile
+                : FPaths::ConvertRelativePathToFull(OriginalInputPath);
+            FPaths::NormalizeFilename(NormalizedOriginalInput);
+            FolderTaskRemainingCounts.Add(InFile, EnqueuedCount);
+            FolderTaskOriginalInputPaths.Add(InFile, NormalizedOriginalInput);
+            FolderTaskOutputFolders.Add(InFile, InFile);
         }
         return;
     }
@@ -175,10 +236,7 @@ void UExeLauncher::ExecuteNextTask()
         }
 
         UE_LOG(LogTemp, Warning, TEXT("Skip folder task file due to previous failure: %s"), *CurrentTask.InputFile);
-        if (TaskCompletedCallback.IsBound())
-        {
-            TaskCompletedCallback.Execute(CurrentTask.InputFile, TEXT(""), TEXT(""));
-        }
+        HandleFolderTaskProgress(CurrentTask);
     }
 
     if (ShouldSkipTask(CurrentTask) || CurrentTask.InputFile.IsEmpty())
@@ -358,7 +416,14 @@ void UExeLauncher::LaunchExeAsync(const FString& ExePath, const FString& Args, c
                 {
                     AsyncTask(ENamedThreads::GameThread, [Task]()
                         {
-                            TaskCompletedCallback.Execute(Task.InputFile, TEXT("ERROR"), TEXT("Failed to start exe"));
+                            if (Task.bIsFolderTask)
+                            {
+                                HandleFolderTaskProgress(Task);
+                            }
+                            else
+                            {
+                                TaskCompletedCallback.Execute(Task.InputFile, TEXT("ERROR"), TEXT("Failed to start exe"));
+                            }
                         });
                 }
 
@@ -482,16 +547,83 @@ void UExeLauncher::LaunchExeAsync(const FString& ExePath, const FString& Args, c
                 }
             }
 
+            if (bSuccess && Task.bIsFolderTask && !OutputFilePath.IsEmpty())
+            {
+                FString ConvertedPath = FPaths::ConvertRelativePathToFull(OutputFilePath);
+                FString InputPath = FPaths::ConvertRelativePathToFull(Task.InputFile);
+                FPaths::NormalizeFilename(ConvertedPath);
+                FPaths::NormalizeFilename(InputPath);
 
-            if (TaskCompletedCallback.IsBound())
+                if (!ConvertedPath.Equals(InputPath, ESearchCase::IgnoreCase))
+                {
+                    bool bReplaced = false;
+                    IFileManager& FileManager = IFileManager::Get();
+
+                    if (FileManager.FileExists(*ConvertedPath))
+                    {
+                        const FString InputDir = FPaths::GetPath(InputPath);
+                        if (!InputDir.IsEmpty())
+                        {
+                            FileManager.MakeDirectory(*InputDir, true);
+                        }
+
+                        bReplaced = (FileManager.Copy(*InputPath, *ConvertedPath, true, true) == COPY_OK);
+                        if (bReplaced)
+                        {
+                            if (!FileManager.Delete(*ConvertedPath, false, true, true))
+                            {
+                                UE_LOG(LogTemp, Warning, TEXT("Replacement succeeded but failed to delete converted temp file: %s"), *ConvertedPath);
+                            }
+                        }
+                        else
+                        {
+                            UE_LOG(LogTemp, Error, TEXT("Replace copy failed: %s <= %s"), *InputPath, *ConvertedPath);
+                        }
+                    }
+                    else
+                    {
+                        UE_LOG(LogTemp, Error, TEXT("Converted file not found for replacement: %s"), *ConvertedPath);
+                    }
+
+                    if (!bReplaced)
+                    {
+                        bSuccess = false;
+                        OutputFilePath = TEXT("");
+                        OutputFileName = TEXT("");
+                        UE_LOG(LogTemp, Error, TEXT("Failed to replace original file for folder task: %s"), *Task.InputFile);
+                    }
+                    else
+                    {
+                        OutputFilePath = InputPath;
+                        OutputFileName = FPaths::GetCleanFilename(InputPath);
+                        UE_LOG(LogTemp, Log, TEXT("Replaced original folder-task input file: %s"), *InputPath);
+                    }
+                }
+            }
+
+
+            if (Task.bIsFolderTask)
+            {
+                const bool bTaskFailed = (!bSuccess || OutputFilePath.IsEmpty());
+                AsyncTask(ENamedThreads::GameThread, [Task, bTaskFailed]()
+                    {
+                        if (bTaskFailed)
+                        {
+                            bAllTasksSuccess = false;
+                            MarkFolderTaskFailed(Task);
+                        }
+                        HandleFolderTaskProgress(Task);
+                    });
+            }
+            else if (TaskCompletedCallback.IsBound())
             {
                 AsyncTask(ENamedThreads::GameThread, [Task, OutputFilePath, OutputFileName]()
                     {
                         TaskCompletedCallback.Execute(Task.InputFile, OutputFilePath, OutputFileName);
                     });
             }
-
-            if (!bSuccess || OutputFilePath.IsEmpty())
+            
+            if ((!Task.bIsFolderTask) && (!bSuccess || OutputFilePath.IsEmpty()))
             {
                 AsyncTask(ENamedThreads::GameThread, [Task]()
                     {
@@ -517,6 +649,46 @@ void UExeLauncher::MarkFolderTaskFailed(const FExeTask& Task)
     {
         FScopeLock Lock(&Mutex);
         FailedFolderTaskKeys.Add(Task.FolderTaskKey);
+    }
+}
+
+void UExeLauncher::HandleFolderTaskProgress(const FExeTask& Task)
+{
+    if (!Task.bIsFolderTask || Task.FolderTaskKey.IsEmpty())
+    {
+        return;
+    }
+
+    FString OriginalInputPath;
+    FString FolderOutputPath;
+    bool bShouldNotify = false;
+
+    {
+        FScopeLock Lock(&Mutex);
+        int32* Remaining = FolderTaskRemainingCounts.Find(Task.FolderTaskKey);
+        if (!Remaining)
+        {
+            return;
+        }
+
+        *Remaining -= 1;
+        if (*Remaining <= 0)
+        {
+            bShouldNotify = true;
+            OriginalInputPath = FolderTaskOriginalInputPaths.FindRef(Task.FolderTaskKey);
+            FolderOutputPath = FolderTaskOutputFolders.FindRef(Task.FolderTaskKey);
+
+            FolderTaskRemainingCounts.Remove(Task.FolderTaskKey);
+            FolderTaskOriginalInputPaths.Remove(Task.FolderTaskKey);
+            FolderTaskOutputFolders.Remove(Task.FolderTaskKey);
+            FailedFolderTaskKeys.Remove(Task.FolderTaskKey);
+        }
+    }
+
+    if (bShouldNotify && TaskCompletedCallback.IsBound())
+    {
+        const FString OutputName = FPaths::GetCleanFilename(FolderOutputPath);
+        TaskCompletedCallback.Execute(OriginalInputPath, FolderOutputPath, OutputName);
     }
 }
 
@@ -569,6 +741,9 @@ void UExeLauncher::ClearAllTasks()
     FExeTask Dummy;
     while (TaskQueue.Dequeue(Dummy)) {}
     FailedFolderTaskKeys.Reset();
+    FolderTaskRemainingCounts.Reset();
+    FolderTaskOriginalInputPaths.Reset();
+    FolderTaskOutputFolders.Reset();
     UE_LOG(LogTemp, Log, TEXT("Cleared all pending tasks"));
 }
 
@@ -587,6 +762,9 @@ void UExeLauncher::AbortAllTasks()
         FExeTask Dummy;
         while (TaskQueue.Dequeue(Dummy)) {}
         FailedFolderTaskKeys.Reset();
+        FolderTaskRemainingCounts.Reset();
+        FolderTaskOriginalInputPaths.Reset();
+        FolderTaskOutputFolders.Reset();
     }
 
     bIsRunning = false;
