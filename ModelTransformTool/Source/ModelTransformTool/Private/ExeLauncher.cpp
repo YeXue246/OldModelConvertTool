@@ -72,7 +72,7 @@ void UExeLauncher::HandleTaskFailure(const FExeTask& Task, const FString& ErrorM
 }
 
 
-void UExeLauncher::AddTask(const FString& InputFile, const FString& OutputFolder, const FString& TemplateFile)
+void UExeLauncher::AddTask(const FString& InputFile, const FString& OutputFolder, const FString& TemplateFile, const FString& FolderModelExtensionsCsv)
 {
     FScopeLock Lock(&Mutex);
 
@@ -102,14 +102,22 @@ void UExeLauncher::AddTask(const FString& InputFile, const FString& OutputFolder
         IFileManager::Get().FindFilesRecursive(FilesInFolder, *InFile, TEXT("*.*"), true, false, false);
         FilesInFolder.Sort();
 
-        const TSet<FString> AllowedModelExtensions = {
-            TEXT("obj"),
-            TEXT("stl"),
-            TEXT("3ds"),
-            TEXT("ase"),
-            TEXT("stp"),
-            TEXT("step")
-        };
+        TSet<FString> AllowedModelExtensions;
+        TArray<FString> ExtTokens;
+        FolderModelExtensionsCsv.ParseIntoArray(ExtTokens, TEXT(","), true);
+        for (FString Ext : ExtTokens)
+        {
+            Ext.TrimStartAndEndInline();
+            Ext = Ext.ToLower();
+            if (Ext.StartsWith(TEXT(".")))
+            {
+                Ext.RightChopInline(1, false);
+            }
+            if (!Ext.IsEmpty())
+            {
+                AllowedModelExtensions.Add(Ext);
+            }
+        }
 
         if (FilesInFolder.IsEmpty())
         {
@@ -124,7 +132,7 @@ void UExeLauncher::AddTask(const FString& InputFile, const FString& OutputFolder
             FPaths::NormalizeFilename(NormalizedFile);
             const FString FileExt = FPaths::GetExtension(NormalizedFile, false).ToLower();
 
-            if (!AllowedModelExtensions.Contains(FileExt))
+            if (!AllowedModelExtensions.IsEmpty() && !AllowedModelExtensions.Contains(FileExt))
             {
                 UE_LOG(LogTemp, Verbose, TEXT("Skip non-model file in folder task: %s"), *NormalizedFile);
                 continue;
