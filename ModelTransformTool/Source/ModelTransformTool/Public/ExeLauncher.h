@@ -41,7 +41,7 @@ class MODELTRANSFORMTOOL_API UExeLauncher : public UBlueprintFunctionLibrary
 
 public:
     UFUNCTION(BlueprintCallable, Category = "ExeLauncher")
-    static void AddTask(const FString& InputFile, const FString& OutputFolder, const FString& TemplateFile);
+    static void AddTask(const FString& InputFile, const FString& OutputFolder, const FString& TemplateFile, const FString& FolderModelExtensionsCsv = TEXT("obj,stl,3ds,ase,stp,step"), const FString& OriginalInputPath = TEXT(""));
 
     UFUNCTION(BlueprintCallable, Category = "ExeLauncher")
     static void RunQueue(const FOnTaskCompleted& OnTaskCompleted, const FOnAllTasksCompleted& OnAllTasksCompleted, const FOnTaskStarted& OnTaskStarted);
@@ -70,6 +70,7 @@ public:
     static bool  FileIsLargerThanKB(const FString& FilePath,const int32 TargetSize);
 
 private:
+    static void HandleFolderTaskProgress(const FExeTask& Task);
     static void ExecuteNextTask();
     static void CopyDependencies(const FString& ExeDir);
     static void LaunchExeAsync(const FString& ExePath, const FString& Args, const FString& OutputFolder, const FExeTask& Task);
@@ -88,6 +89,9 @@ private:
     static FOnAllTasksCompleted AllTasksCompletedCallback;
     static FOnTaskStarted TaskStartedCallback;
     static TSet<FString> FailedFolderTaskKeys;
+    static TMap<FString, int32> FolderTaskRemainingCounts;
+    static TMap<FString, FString> FolderTaskOriginalInputPaths;
+    static TMap<FString, FString> FolderTaskOutputFolders;
 
     static FProcHandle CurrentProcHandle;
     static FCriticalSection Mutex;
