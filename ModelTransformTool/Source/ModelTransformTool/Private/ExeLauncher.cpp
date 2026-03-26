@@ -102,16 +102,33 @@ void UExeLauncher::AddTask(const FString& InputFile, const FString& OutputFolder
         IFileManager::Get().FindFilesRecursive(FilesInFolder, *InFile, TEXT("*.*"), true, false, false);
         FilesInFolder.Sort();
 
+        const TSet<FString> AllowedModelExtensions = {
+            TEXT("obj"),
+            TEXT("stl"),
+            TEXT("3ds"),
+            TEXT("ase"),
+            TEXT("stp"),
+            TEXT("step")
+        };
+
         if (FilesInFolder.IsEmpty())
         {
             UE_LOG(LogTemp, Warning, TEXT("Folder task has no files: %s"), *InFile);
             return;
         }
 
+        int32 EnqueuedCount = 0;
         for (const FString& FilePath : FilesInFolder)
         {
             FString NormalizedFile = FPaths::ConvertRelativePathToFull(FilePath);
             FPaths::NormalizeFilename(NormalizedFile);
+            const FString FileExt = FPaths::GetExtension(NormalizedFile, false).ToLower();
+
+            if (!AllowedModelExtensions.Contains(FileExt))
+            {
+                UE_LOG(LogTemp, Verbose, TEXT("Skip non-model file in folder task: %s"), *NormalizedFile);
+                continue;
+            }
 
             FExeTask FolderTask;
             FolderTask.InputFile = NormalizedFile;
@@ -121,6 +138,12 @@ void UExeLauncher::AddTask(const FString& InputFile, const FString& OutputFolder
             FolderTask.FolderTaskKey = InFile;
 
             TaskQueue.Enqueue(FolderTask);
+            ++EnqueuedCount;
+        }
+
+        if (EnqueuedCount == 0)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("Folder task has no supported model files: %s"), *InFile);
         }
         return;
     }
