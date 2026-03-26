@@ -72,7 +72,7 @@ void UExeLauncher::HandleTaskFailure(const FExeTask& Task, const FString& ErrorM
 }
 
 
-void UExeLauncher::AddTask(const FString& InputFile, const FString& OutputFolder, const FString& TemplateFile)
+void UExeLauncher::AddTask(const FString& InputFile, const FString& OutputFolder, const FString& TemplateFile, const FString& FolderModelExtensionsCsv)
 {
     FScopeLock Lock(&Mutex);
 
@@ -102,16 +102,41 @@ void UExeLauncher::AddTask(const FString& InputFile, const FString& OutputFolder
         IFileManager::Get().FindFilesRecursive(FilesInFolder, *InFile, TEXT("*.*"), true, false, false);
         FilesInFolder.Sort();
 
+        TSet<FString> AllowedModelExtensions;
+        TArray<FString> ExtTokens;
+        FolderModelExtensionsCsv.ParseIntoArray(ExtTokens, TEXT(","), true);
+        for (FString Ext : ExtTokens)
+        {
+            Ext.TrimStartAndEndInline();
+            Ext = Ext.ToLower();
+            if (Ext.StartsWith(TEXT(".")))
+            {
+                Ext.RightChopInline(1, false);
+            }
+            if (!Ext.IsEmpty())
+            {
+                AllowedModelExtensions.Add(Ext);
+            }
+        }
+
         if (FilesInFolder.IsEmpty())
         {
             UE_LOG(LogTemp, Warning, TEXT("Folder task has no files: %s"), *InFile);
             return;
         }
 
+        int32 EnqueuedCount = 0;
         for (const FString& FilePath : FilesInFolder)
         {
             FString NormalizedFile = FPaths::ConvertRelativePathToFull(FilePath);
             FPaths::NormalizeFilename(NormalizedFile);
+            const FString FileExt = FPaths::GetExtension(NormalizedFile, false).ToLower();
+
+            if (!AllowedModelExtensions.IsEmpty() && !AllowedModelExtensions.Contains(FileExt))
+            {
+                UE_LOG(LogTemp, Verbose, TEXT("Skip non-model file in folder task: %s"), *NormalizedFile);
+                continue;
+            }
 
             FExeTask FolderTask;
             FolderTask.InputFile = NormalizedFile;
@@ -121,6 +146,12 @@ void UExeLauncher::AddTask(const FString& InputFile, const FString& OutputFolder
             FolderTask.FolderTaskKey = InFile;
 
             TaskQueue.Enqueue(FolderTask);
+            ++EnqueuedCount;
+        }
+
+        if (EnqueuedCount == 0)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("Folder task has no supported model files: %s"), *InFile);
         }
         return;
     }
@@ -478,6 +509,46 @@ void UExeLauncher::LaunchExeAsync(const FString& ExePath, const FString& Args, c
                                 break;
                             }
                         }
+                    }
+                }
+            }
+
+            if (bSuccess && Task.bIsFolderTask && !OutputFilePath.IsEmpty())
+            {
+                FString ConvertedPath = FPaths::ConvertRelativePathToFull(OutputFilePath);
+                FString InputPath = FPaths::ConvertRelativePathToFull(Task.InputFile);
+                FPaths::NormalizeFilename(ConvertedPath);
+                FPaths::NormalizeFilename(InputPath);
+
+                if (!ConvertedPath.Equals(InputPath, ESearchCase::IgnoreCase))
+                {
+                    bool bReplaced = false;
+                    IFileManager& FileManager = IFileManager::Get();
+
+                    if (FileManager.FileExists(*ConvertedPath))
+                    {
+                        if (FileManager.Delete(*InputPath, false, true, true))
+                        {
+                            bReplaced = (FileManager.Move(*InputPath, *ConvertedPath, true, true) == COPY_OK);
+                        }
+                        else
+                        {
+                            UE_LOG(LogTemp, Error, TEXT("Failed to delete original input file before replace: %s"), *InputPath);
+                        }
+                    }
+
+                    if (!bReplaced)
+                    {
+                        bSuccess = false;
+                        OutputFilePath = TEXT("");
+                        OutputFileName = TEXT("");
+                        UE_LOG(LogTemp, Error, TEXT("Failed to replace original file for folder task: %s"), *Task.InputFile);
+                    }
+                    else
+                    {
+                        OutputFilePath = InputPath;
+                        OutputFileName = FPaths::GetCleanFilename(InputPath);
+                        UE_LOG(LogTemp, Log, TEXT("Replaced original folder-task input file: %s"), *InputPath);
                     }
                 }
             }
