@@ -41,7 +41,7 @@ class MODELTRANSFORMTOOL_API UExeLauncher : public UBlueprintFunctionLibrary
 
 public:
     UFUNCTION(BlueprintCallable, Category = "ExeLauncher")
-    static void AddTask(const FString& InputFile, const FString& OutputFolder, const FString& TemplateFile);
+    static void AddTask(const FString& InputFile, const FString& OutputFolder, const FString& TemplateFile, const FString& FolderModelExtensionsCsv = TEXT("obj,stl,3ds,ase,stp,step"));
 
     UFUNCTION(BlueprintCallable, Category = "ExeLauncher")
     static void RunQueue(const FOnTaskCompleted& OnTaskCompleted, const FOnAllTasksCompleted& OnAllTasksCompleted, const FOnTaskStarted& OnTaskStarted);
