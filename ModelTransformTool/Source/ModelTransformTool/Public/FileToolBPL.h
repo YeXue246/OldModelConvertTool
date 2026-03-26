@@ -18,6 +18,12 @@ public:
     static bool ClearFolderContents(const FString& FolderPath);
 
     UFUNCTION(BlueprintCallable, Category = "FileTool")
+    static void GetPathType(const FString& InputPath, bool& bIsDirectory, bool& bIsFile);
+
+    UFUNCTION(BlueprintCallable, Category = "FileTool")
+    static TArray<FString> GetAllFbxFilesInFolder(const FString& FolderPath);
+
+    UFUNCTION(BlueprintCallable, Category = "FileTool")
     static FString ZipFolder(const FString& FolderPath);
 
     UFUNCTION(BlueprintCallable, Category = "FileTool")

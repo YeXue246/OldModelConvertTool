@@ -62,6 +62,48 @@ bool UFileToolBPL::ClearFolderContents(const FString& FolderPath)
     return true;
 }
 
+void UFileToolBPL::GetPathType(const FString& InputPath, bool& bIsDirectory, bool& bIsFile)
+{
+    FString FullPath = FPaths::ConvertRelativePathToFull(InputPath);
+    FPaths::NormalizeFilename(FullPath);
+
+    IFileManager& FileManager = IFileManager::Get();
+    bIsDirectory = FileManager.DirectoryExists(*FullPath);
+    bIsFile = FileManager.FileExists(*FullPath);
+}
+
+TArray<FString> UFileToolBPL::GetAllFbxFilesInFolder(const FString& FolderPath)
+{
+    TArray<FString> OutFbxFiles;
+
+    FString FullFolderPath = FPaths::ConvertRelativePathToFull(FolderPath);
+    FPaths::NormalizeDirectoryName(FullFolderPath);
+
+    IFileManager& FileManager = IFileManager::Get();
+    if (!FileManager.DirectoryExists(*FullFolderPath))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("Folder not found for FBX search: %s"), *FullFolderPath);
+        return OutFbxFiles;
+    }
+
+    TArray<FString> FoundFiles;
+    FileManager.FindFilesRecursive(FoundFiles, *FullFolderPath, TEXT("*.*"), true, false, false);
+    FoundFiles.Sort();
+
+    for (FString FilePath : FoundFiles)
+    {
+        if (FPaths::GetExtension(FilePath, false).ToLower() != TEXT("fbx"))
+        {
+            continue;
+        }
+        FString FullFilePath = FPaths::ConvertRelativePathToFull(FilePath);
+        FPaths::NormalizeFilename(FullFilePath);
+        OutFbxFiles.Add(FullFilePath);
+    }
+
+    return OutFbxFiles;
+}
+
 FString UFileToolBPL::ZipFolder(const FString& FolderPath)
 {
 #if PLATFORM_WINDOWS
