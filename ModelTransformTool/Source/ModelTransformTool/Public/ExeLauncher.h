@@ -20,6 +20,7 @@ struct FExeTask
     FString OutputFolder;
     FString TemplateFile;
     bool bIsFolderTask = false;
+    bool bSkipExecution = false;
     FString FolderTaskKey;
 };
 
