@@ -146,6 +146,7 @@ void UExeLauncher::AddTask(const FString& InputFile, const FString& OutputFolder
         }
 
         int32 EnqueuedCount = 0;
+        int32 ExistingFbxCount = 0;
         for (const FString& FilePath : FilesInFolder)
         {
             FString NormalizedFile = FPaths::ConvertRelativePathToFull(FilePath);
@@ -155,6 +156,12 @@ void UExeLauncher::AddTask(const FString& InputFile, const FString& OutputFolder
             if (!AllowedModelExtensions.IsEmpty() && !AllowedModelExtensions.Contains(FileExt))
             {
                 UE_LOG(LogTemp, Verbose, TEXT("Skip non-model file in folder task: %s"), *NormalizedFile);
+                continue;
+            }
+
+            if (FileExt == TEXT("fbx"))
+            {
+                ++ExistingFbxCount;
                 continue;
             }
 
@@ -171,7 +178,31 @@ void UExeLauncher::AddTask(const FString& InputFile, const FString& OutputFolder
 
         if (EnqueuedCount == 0)
         {
-            UE_LOG(LogTemp, Warning, TEXT("Folder task has no supported model files: %s"), *InFile);
+            if (ExistingFbxCount > 0)
+            {
+                UE_LOG(LogTemp, Log, TEXT("Folder task contains only FBX files, mark as completed without conversion: %s"), *InFile);
+
+                FString NormalizedOriginalInput = OriginalInputPath.TrimStartAndEnd().IsEmpty()
+                    ? InFile
+                    : FPaths::ConvertRelativePathToFull(OriginalInputPath);
+                FPaths::NormalizeFilename(NormalizedOriginalInput);
+                FolderTaskRemainingCounts.Add(InFile, 1);
+                FolderTaskOriginalInputPaths.Add(InFile, NormalizedOriginalInput);
+                FolderTaskOutputFolders.Add(InFile, InFile);
+
+                FExeTask NoopTask;
+                NoopTask.InputFile = InFile;
+                NoopTask.OutputFolder = OutDir;
+                NoopTask.TemplateFile = TeFile;
+                NoopTask.bIsFolderTask = true;
+                NoopTask.bSkipExecution = true;
+                NoopTask.FolderTaskKey = InFile;
+                TaskQueue.Enqueue(NoopTask);
+            }
+            else
+            {
+                UE_LOG(LogTemp, Warning, TEXT("Folder task has no supported model files: %s"), *InFile);
+            }
         }
         else
         {
@@ -186,7 +217,7 @@ void UExeLauncher::AddTask(const FString& InputFile, const FString& OutputFolder
         return;
     }
 
-    TaskQueue.Enqueue(FExeTask{ InFile, OutDir, TeFile, false, TEXT("") });
+    TaskQueue.Enqueue(FExeTask{ InFile, OutDir, TeFile, false, false, TEXT("") });
 }
 
 void UExeLauncher::RunQueue(const FOnTaskCompleted& OnTaskCompleted, const FOnAllTasksCompleted& OnAllTasksCompleted, const FOnTaskStarted& OnTaskStarted)
@@ -237,6 +268,13 @@ void UExeLauncher::ExecuteNextTask()
 
         UE_LOG(LogTemp, Warning, TEXT("Skip folder task file due to previous failure: %s"), *CurrentTask.InputFile);
         HandleFolderTaskProgress(CurrentTask);
+    }
+
+    if (CurrentTask.bSkipExecution)
+    {
+        HandleFolderTaskProgress(CurrentTask);
+        ExecuteNextTask();
+        return;
     }
 
     if (ShouldSkipTask(CurrentTask) || CurrentTask.InputFile.IsEmpty())
@@ -332,7 +370,17 @@ void UExeLauncher::ExecuteNextTask()
 
     if (TaskStartedCallback.IsBound())
     {
-        TaskStartedCallback.Execute(CurrentTask.InputFile);
+        FString TaskStartedInputPath = CurrentTask.InputFile;
+        if (CurrentTask.bIsFolderTask && !CurrentTask.FolderTaskKey.IsEmpty())
+        {
+            FScopeLock Lock(&Mutex);
+            const FString FolderOriginalInput = FolderTaskOriginalInputPaths.FindRef(CurrentTask.FolderTaskKey);
+            if (!FolderOriginalInput.IsEmpty())
+            {
+                TaskStartedInputPath = FolderOriginalInput;
+            }
+        }
+        TaskStartedCallback.Execute(TaskStartedInputPath);
     }
 
     LaunchExeAsync(ExePath, Args, CurrentTask.OutputFolder, CurrentTask);
@@ -551,33 +599,28 @@ void UExeLauncher::LaunchExeAsync(const FString& ExePath, const FString& Args, c
             {
                 FString ConvertedPath = FPaths::ConvertRelativePathToFull(OutputFilePath);
                 FString InputPath = FPaths::ConvertRelativePathToFull(Task.InputFile);
+                const FString InputDir = FPaths::GetPath(InputPath);
                 FPaths::NormalizeFilename(ConvertedPath);
                 FPaths::NormalizeFilename(InputPath);
+                FString DestinationPath = FPaths::Combine(InputDir, FPaths::GetCleanFilename(ConvertedPath));
+                FPaths::NormalizeFilename(DestinationPath);
 
-                if (!ConvertedPath.Equals(InputPath, ESearchCase::IgnoreCase))
+                if (!ConvertedPath.Equals(DestinationPath, ESearchCase::IgnoreCase))
                 {
-                    bool bReplaced = false;
+                    bool bCopied = false;
                     IFileManager& FileManager = IFileManager::Get();
 
                     if (FileManager.FileExists(*ConvertedPath))
                     {
-                        const FString InputDir = FPaths::GetPath(InputPath);
                         if (!InputDir.IsEmpty())
                         {
                             FileManager.MakeDirectory(*InputDir, true);
                         }
 
-                        bReplaced = (FileManager.Copy(*InputPath, *ConvertedPath, true, true) == COPY_OK);
-                        if (bReplaced)
+                        bCopied = (FileManager.Copy(*DestinationPath, *ConvertedPath, true, true) == COPY_OK);
+                        if (!bCopied)
                         {
-                            if (!FileManager.Delete(*ConvertedPath, false, true, true))
-                            {
-                                UE_LOG(LogTemp, Warning, TEXT("Replacement succeeded but failed to delete converted temp file: %s"), *ConvertedPath);
-                            }
-                        }
-                        else
-                        {
-                            UE_LOG(LogTemp, Error, TEXT("Replace copy failed: %s <= %s"), *InputPath, *ConvertedPath);
+                            UE_LOG(LogTemp, Error, TEXT("Copy converted file to source folder failed: %s <= %s"), *DestinationPath, *ConvertedPath);
                         }
                     }
                     else
@@ -585,18 +628,35 @@ void UExeLauncher::LaunchExeAsync(const FString& ExePath, const FString& Args, c
                         UE_LOG(LogTemp, Error, TEXT("Converted file not found for replacement: %s"), *ConvertedPath);
                     }
 
-                    if (!bReplaced)
+                    if (!bCopied)
                     {
                         bSuccess = false;
                         OutputFilePath = TEXT("");
                         OutputFileName = TEXT("");
-                        UE_LOG(LogTemp, Error, TEXT("Failed to replace original file for folder task: %s"), *Task.InputFile);
+                        UE_LOG(LogTemp, Error, TEXT("Failed to copy converted file back for folder task: %s"), *Task.InputFile);
                     }
                     else
                     {
-                        OutputFilePath = InputPath;
-                        OutputFileName = FPaths::GetCleanFilename(InputPath);
-                        UE_LOG(LogTemp, Log, TEXT("Replaced original folder-task input file: %s"), *InputPath);
+                        OutputFilePath = DestinationPath;
+                        OutputFileName = FPaths::GetCleanFilename(DestinationPath);
+                        UE_LOG(LogTemp, Log, TEXT("Copied converted FBX back to source folder: %s"), *OutputFilePath);
+                    }
+                }
+                else
+                {
+                    OutputFilePath = DestinationPath;
+                    OutputFileName = FPaths::GetCleanFilename(DestinationPath);
+                }
+
+                if (bSuccess && !InputPath.Equals(OutputFilePath, ESearchCase::IgnoreCase))
+                {
+                    IFileManager& FileManager = IFileManager::Get();
+                    if (FileManager.FileExists(*InputPath) && !FileManager.Delete(*InputPath, false, true, true))
+                    {
+                        bSuccess = false;
+                        OutputFilePath = TEXT("");
+                        OutputFileName = TEXT("");
+                        UE_LOG(LogTemp, Error, TEXT("Converted successfully but failed to delete original source file: %s"), *InputPath);
                     }
                 }
             }
